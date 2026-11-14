@@ -1,0 +1,1045 @@
+/* Gestor de ventanas estilo Windows XP: escritorio con iconos, terminal, explorador,
+ * calculadora, panel de control, Snake, Tetris y un juego de coches simple.
+ * Doble buffer por GPU, ratón + teclado. */
+#include "kernel.h"
+
+extern const u8 font8x8[95][8];
+
+struct surf { u32 *px; int w, h; };
+static struct surf surfs[MAX_GPUS];
+
+#define TCOLS   78
+#define TLINES  100
+#define HIST    16
+#define MAXWIN  12
+#define TITLEH  22
+#define TASKH   30
+#define ICON_W  48
+#define ICON_H  56
+
+enum {
+    W_NONE, W_TERM, W_FILES, W_VIEW, W_ABOUT, W_CALC,
+    W_SNAKE, W_TETRIS, W_RACE, W_CTRL
+};
+
+struct window {
+    int kind, x, y, w, h, maxed, rx, ry, rw, rh;
+    char title[48]; u32 accent;
+    /* terminal */
+    char lines[TLINES][TCOLS + 1]; int row, col, scroll;
+    char in[128]; int inlen; char hist[HIST][128]; int nhist, hpos; struct shell sh;
+    /* explorador */
+    struct { char name[48]; int isdir; u32 size; } ent[64]; int nent, sel, top; char path[128];
+    /* visor */
+    char text[4096]; int tlen;
+    /* calculadora (solo enteros, sin FPU) */
+    char cdisp[32]; long cval, cacc; char cop; int cnew;
+    /* snake */
+    int sx[256], sy[256], sn, sdir, snx, sny, sfoodx, sfoody, sscore, sdead, stick;
+    /* tetris */
+    int tboard[20][10], tcur[4][4], tpx, tpy, tscore, tlines, tlevel, ttick, tnext, tgameover;
+    /* race */
+    int rxpos, rscore, rspeed, rtick, rlives, rdead;
+    int robstx[8], robsty[8], robstw[8];
+};
+
+static struct window wins[MAXWIN], *z[MAXWIN];
+static int nz, dirty = 1, term_count, tick;
+static struct fat32 *g_fs;
+static int mx = 200, my = 200, mbtn, drag_dx, drag_dy;
+static struct window *dragging;
+static int start_open;
+
+/* ---- desktop icons ---- */
+struct desk_icon {
+    int x, y;
+    const char *label;
+    int kind;           /* window kind to open, or special */
+};
+static const struct desk_icon icons[] = {
+    {  24,  24, "Terminal",   W_TERM },
+    {  24, 100, "Archivos",   W_FILES },
+    {  24, 176, "Calculadora",W_CALC },
+    {  24, 252, "Snake",      W_SNAKE },
+    {  24, 328, "Tetris",     W_TETRIS },
+    {  24, 404, "Coches 3D",  W_RACE },
+    { 100,  24, "Sistema",    W_ABOUT },
+    { 100, 100, "Control",    W_CTRL },
+};
+#define NICONS (int)(sizeof icons / sizeof icons[0])
+
+static void scopy(char *d, const char *s, size_t n) {
+    size_t i = 0; for (; s[i] && i + 1 < n; i++) d[i] = s[i]; d[i] = 0;
+}
+
+/* ---------- dibujo básico ---------- */
+static void rect(struct surf *s, int x, int y, int w, int h, u32 c) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > s->w) w = s->w - x;
+    if (y + h > s->h) h = s->h - y;
+    if (w <= 0 || h <= 0) return;
+    for (int j = 0; j < h; j++) {
+        u32 *r = s->px + (size_t)(y + j) * s->w + x;
+        for (int i = 0; i < w; i++) r[i] = c;
+    }
+}
+static void frame(struct surf *s, int x, int y, int w, int h, u32 c) {
+    rect(s, x, y, w, 1, c); rect(s, x, y + h - 1, w, 1, c);
+    rect(s, x, y, 1, h, c); rect(s, x + w - 1, y, 1, h, c);
+}
+static void glyph(struct surf *s, int x, int y, int ch, u32 col) {
+    if (ch < 32 || ch > 126) ch = '?';
+    if (x < 0 || y < 0 || x + 8 > s->w || y + 8 > s->h) return;
+    for (int r = 0; r < 8; r++) {
+        u32 *row = s->px + (size_t)(y + r) * s->w + x;
+        u8 bits = font8x8[ch - 32][r];
+        for (int b = 0; b < 8; b++) if (bits >> b & 1) row[b] = col;
+    }
+}
+static void text(struct surf *s, int x, int y, const char *str, u32 col, int max) {
+    for (; *str && max > 0; str++, max--, x += 8) glyph(s, x, y, *str, col);
+}
+static void text_shadow(struct surf *s, int x, int y, const char *str, u32 col, int max) {
+    text(s, x + 1, y + 1, str, 0x00000000, max);
+    text(s, x, y, str, col, max);
+}
+
+/* cursor clásico */
+static const char *cursor_img[19] = {
+    "X           ", "XX          ", "X.X         ", "X..X        ", "X...X       ", "X....X      ", "X.....X     ",
+    "X......X    ", "X.......X   ", "X........X  ", "X.....XXXXX ", "X..X..X     ", "X.X X..X    ", "XX  X..X    ",
+    "X    X..X   ", "     X..X   ", "      X..X  ", "      X..X  ", "       XX   " };
+static void draw_cursor(struct surf *s) {
+    for (int j = 0; j < 19; j++)
+        for (int i = 0; cursor_img[j][i]; i++) {
+            char c = cursor_img[j][i]; int x = mx + i, y = my + j;
+            if (c == ' ' || x < 0 || y < 0 || x >= s->w || y >= s->h) continue;
+            s->px[(size_t)y * s->w + x] = c == 'X' ? 0x00000000 : 0x00FFFFFF;
+        }
+}
+
+/* ---------- ventanas ---------- */
+static void raise_win(struct window *w) {
+    int i = 0; while (i < nz && z[i] != w) i++;
+    if (i == nz) return;
+    for (; i + 1 < nz; i++) z[i] = z[i + 1];
+    z[nz - 1] = w; dirty = 1;
+}
+static void close_win(struct window *w) {
+    int i = 0; while (i < nz && z[i] != w) i++;
+    for (; i + 1 < nz; i++) z[i] = z[i + 1];
+    if (nz) nz--;
+    if (dragging == w) dragging = 0;
+    w->kind = W_NONE; dirty = 1;
+}
+static struct window *new_win(int kind) {
+    for (int i = 0; i < MAXWIN; i++) if (wins[i].kind == W_NONE) {
+        struct window *w = &wins[i]; memset(w, 0, sizeof *w); w->kind = kind;
+        w->x = 40 + 24 * (nz % 8); w->y = 30 + 20 * (nz % 8);
+        switch (kind) {
+        case W_TERM:   w->w = 660; w->h = 360; w->accent = 0x00005AA0; break;
+        case W_FILES:  w->w = 440; w->h = 320; w->accent = 0x00005AA0; break;
+        case W_VIEW:   w->w = 560; w->h = 340; w->accent = 0x00005AA0; break;
+        case W_CALC:   w->w = 220; w->h = 280; w->accent = 0x00005AA0; break;
+        case W_SNAKE:  w->w = 420; w->h = 360; w->accent = 0x00005AA0; break;
+        case W_TETRIS: w->w = 280; w->h = 420; w->accent = 0x00005AA0; break;
+        case W_RACE:   w->w = 480; w->h = 360; w->accent = 0x00005AA0; break;
+        case W_CTRL:   w->w = 420; w->h = 340; w->accent = 0x00005AA0; break;
+        default:       w->w = 420; w->h = 260; w->accent = 0x00005AA0; break;
+        }
+        z[nz++] = w; dirty = 1; return w;
+    }
+    return 0;
+}
+
+/* ---- terminal ---- */
+static void t_newline(struct window *w) {
+    w->col = 0;
+    if (w->row < TLINES - 1) w->row++;
+    else { memmove(w->lines[0], w->lines[1], (TLINES - 1) * (TCOLS + 1)); memset(w->lines[TLINES - 1], 0, TCOLS + 1); }
+}
+static void t_put(struct window *w, char c) {
+    if (c == '\n') { t_newline(w); return; }
+    if (c == '\r') return;
+    if (c == '\t') { do t_put(w, ' '); while (w->col & 3); return; }
+    if (w->col >= TCOLS) t_newline(w);
+    w->lines[w->row][w->col++] = c;
+}
+static void t_puts(struct window *w, const char *s) { for (; *s; s++) t_put(w, *s); }
+static void term_out(void *ctx, const char *s) { t_puts(ctx, s); }
+static void t_clear(struct window *w) { memset(w->lines, 0, sizeof w->lines); w->row = w->col = w->scroll = 0; }
+
+static void term_open(void) {
+    struct window *w = new_win(W_TERM); if (!w) return;
+    ksnprintf(w->title, sizeof w->title, "Terminal %d", ++term_count);
+    shell_init(&w->sh, g_fs);
+    t_puts(w, "Kuno 0.3 - shell. Escribe 'help'.\n");
+}
+static void term_run(struct window *w) {
+    char pr[160];
+    ksnprintf(pr, sizeof pr, "kuno:%s$ ", w->sh.cwd);
+    t_puts(w, pr); t_puts(w, w->in); t_put(w, '\n');
+    if (w->inlen) {
+        if (w->nhist == HIST) { memmove(w->hist[0], w->hist[1], (HIST - 1) * 128); w->nhist--; }
+        scopy(w->hist[w->nhist++], w->in, 128);
+    }
+    shell_exec(&w->sh, w->in, term_out, w);
+    if (w->sh.want_clear) { t_clear(w); w->sh.want_clear = 0; }
+    if (w->col) t_newline(w);
+    w->inlen = 0; w->in[0] = 0; w->hpos = 0; w->scroll = 0;
+    if (w->sh.want_exit) close_win(w);
+}
+static void term_key(struct window *w, const struct event *e) {
+    int k = e->key;
+    if (e->mods & MOD_CTRL) {
+        if (k == 'l') t_clear(w);
+        else if (k == 'c') { t_puts(w, "kuno$ ^C\n"); w->inlen = 0; w->in[0] = 0; }
+        return;
+    }
+    if (k == KEY_PGUP) { w->scroll += 5; if (w->scroll > w->row) w->scroll = w->row; }
+    else if (k == KEY_PGDN) { w->scroll -= 5; if (w->scroll < 0) w->scroll = 0; }
+    else if (k == KEY_UP) {
+        if (w->hpos < w->nhist) w->hpos++;
+        if (w->hpos) { scopy(w->in, w->hist[w->nhist - w->hpos], 128); w->inlen = (int)strlen(w->in); }
+    } else if (k == KEY_DOWN) {
+        if (w->hpos > 0) w->hpos--;
+        if (w->hpos) scopy(w->in, w->hist[w->nhist - w->hpos], 128); else w->in[0] = 0;
+        w->inlen = (int)strlen(w->in);
+    } else if (k == '\n') term_run(w);
+    else if (k == '\b') { if (w->inlen) w->in[--w->inlen] = 0; }
+    else if (k >= 32 && k < 127 && w->inlen < 100) { w->in[w->inlen++] = (char)k; w->in[w->inlen] = 0; w->scroll = 0; }
+}
+static void draw_term(struct surf *s, struct window *w, int focused) {
+    int x = w->x + 8, y = w->y + TITLEH + 6, vis = (w->h - TITLEH - 10) / 10, R = w->row + 1;
+    int start = R - vis - w->scroll; if (start < 0) start = 0;
+    rect(s, w->x + 2, w->y + TITLEH + 2, w->w - 4, w->h - TITLEH - 4, 0x00001018);
+    for (int i = start, l = 0; i < R && l < vis; i++, l++, y += 10) {
+        if (i == w->row) {
+            char pr[160]; int n = ksnprintf(pr, sizeof pr, "kuno:%s$ ", w->sh.cwd); if (n > 50) n = 50;
+            text(s, x, y, pr, 0x0070C8FF, 50);
+            text(s, x + 8 * n, y, w->in, 0x00FFFFFF, TCOLS - n);
+            if (focused && !w->scroll) rect(s, x + 8 * (n + w->inlen), y, 8, 9, 0x00FFFFFF);
+        } else text(s, x, y, w->lines[i], 0x0090FF90, TCOLS);
+    }
+}
+
+/* ---- explorador ---- */
+struct lctx { struct window *w; int dirs; };
+static int list_cb(void *c, const char *name, u32 cl, u32 size, int isdir) {
+    struct lctx *l = c; struct window *w = l->w; (void)cl;
+    if (name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2]))) return 0;
+    if (isdir != l->dirs) return 0;
+    if (w->nent >= 64) return 1;
+    scopy(w->ent[w->nent].name, name, 48); w->ent[w->nent].isdir = isdir; w->ent[w->nent].size = size; w->nent++;
+    return 0;
+}
+static void files_reload(struct window *w) {
+    struct fat32_file f; struct lctx l = { w, 1 };
+    w->nent = w->sel = w->top = 0;
+    ksnprintf(w->title, sizeof w->title, "Archivos - %s", w->path);
+    if (!g_fs || fat32_open(g_fs, w->path, &f) || !f.isdir) return;
+    fat32_iterate(g_fs, f.first, list_cb, &l); l.dirs = 0; fat32_iterate(g_fs, f.first, list_cb, &l);
+}
+static void files_open_win(void) {
+    struct window *w = new_win(W_FILES); if (!w) return;
+    scopy(w->path, "/", sizeof w->path); files_reload(w);
+}
+static void view_open(const char *path) {
+    struct fat32_file f; if (!g_fs || fat32_open(g_fs, path, &f) || f.isdir) return;
+    struct window *w = new_win(W_VIEW); if (!w) return;
+    long n = fat32_read(g_fs, &f, w->text, sizeof w->text - 1); if (n < 0) n = 0;
+    int m = 0;
+    for (long i = 0; i < n; i++) {
+        char c = w->text[i]; if (c == '\r') continue;
+        w->text[m++] = (c == '\n' || c == '\t' || (c >= 32 && c < 127)) ? c : '.';
+    }
+    w->text[m] = 0; w->tlen = m;
+    const char *base = path; for (const char *p = path; *p; p++) if (*p == '/') base = p + 1;
+    ksnprintf(w->title, sizeof w->title, "Ver: %s", base);
+}
+static void files_activate(struct window *w) {
+    if (w->sel >= w->nent) return;
+    char p[160]; if (path_resolve(w->path, w->ent[w->sel].name, p, sizeof p)) return;
+    if (w->ent[w->sel].isdir) { scopy(w->path, p, sizeof w->path); files_reload(w); }
+    else view_open(p);
+}
+static void files_key(struct window *w, const struct event *e) {
+    int vis = (w->h - TITLEH - 12) / 10, k = e->key;
+    if (k == KEY_UP) { if (w->sel > 0) w->sel--; }
+    else if (k == KEY_DOWN) { if (w->sel + 1 < w->nent) w->sel++; }
+    else if (k == KEY_PGUP) { w->sel -= 10; if (w->sel < 0) w->sel = 0; }
+    else if (k == KEY_PGDN) { w->sel += 10; if (w->sel >= w->nent) w->sel = w->nent ? w->nent - 1 : 0; }
+    else if (k == KEY_HOME) w->sel = 0;
+    else if (k == KEY_END) w->sel = w->nent ? w->nent - 1 : 0;
+    else if (k == '\n') files_activate(w);
+    else if (k == '\b' || k == KEY_LEFT) {
+        char p[160]; if (!path_resolve(w->path, "..", p, sizeof p)) {
+            scopy(w->path, p, sizeof w->path); files_reload(w);
+        }
+    } else if (k == KEY_RIGHT) files_activate(w);
+    if (w->sel < w->top) w->top = w->sel;
+    if (w->sel >= w->top + vis) w->top = w->sel - vis + 1;
+}
+static void draw_files(struct surf *s, struct window *w) {
+    int vis = (w->h - TITLEH - 12) / 10, x = w->x + 8, y = w->y + TITLEH + 6;
+    rect(s, w->x + 2, w->y + TITLEH + 2, w->w - 4, w->h - TITLEH - 4, 0x00F0F0F0);
+    if (!w->nent) text(s, x, y, "(vacio)", 0x00808080, 40);
+    for (int i = w->top, l = 0; i < w->nent && l < vis; i++, l++, y += 10) {
+        if (i == w->sel) rect(s, w->x + 4, y - 1, w->w - 8, 10, 0x003168C4);
+        char b[64];
+        if (w->ent[i].isdir) {
+            ksnprintf(b, sizeof b, "[DIR] %s", w->ent[i].name);
+            text(s, x, y, b, i == w->sel ? 0x00FFFFFF : 0x00000080, 40);
+        } else {
+            text(s, x + 8, y, w->ent[i].name, i == w->sel ? 0x00FFFFFF : 0x00000000, 32);
+            ksnprintf(b, sizeof b, "%u", w->ent[i].size);
+            text(s, w->x + w->w - 10 - 8 * (int)strlen(b), y, b, i == w->sel ? 0x00E0E0FF : 0x00404040, 12);
+        }
+    }
+}
+
+/* ---- visor ---- */
+static void view_key(struct window *w, const struct event *e) {
+    if (e->key == KEY_UP && w->scroll > 0) w->scroll--;
+    else if (e->key == KEY_DOWN) w->scroll++;
+    else if (e->key == KEY_PGUP) { w->scroll -= 10; if (w->scroll < 0) w->scroll = 0; }
+    else if (e->key == KEY_PGDN) w->scroll += 10;
+    else if (e->key == KEY_HOME) w->scroll = 0;
+    else if (e->key == 27) close_win(w);
+}
+static void draw_view(struct surf *s, struct window *w) {
+    int cols = (w->w - 16) / 8, vis = (w->h - TITLEH - 10) / 10, line = 0, col = 0, x = w->x + 8, y0 = w->y + TITLEH + 6;
+    rect(s, w->x + 2, w->y + TITLEH + 2, w->w - 4, w->h - TITLEH - 4, 0x00FFFFF0);
+    for (int i = 0; i <= w->tlen; i++) {
+        char c = w->text[i];
+        if (line >= w->scroll && line < w->scroll + vis && c >= 32)
+            glyph(s, x + 8 * col, y0 + (line - w->scroll) * 10, c, 0x00000000);
+        if (c == '\n' || c == '\t' || col + 1 >= cols) {
+            if (c == '\t') col += 4 - (col & 3);
+            if (c == '\n' || col + 1 >= cols) { line++; col = 0; }
+            else if (c >= 32) col++;
+        } else col++;
+    }
+}
+
+/* ---- calculadora ---- */
+static void calc_open(void) {
+    struct window *w = new_win(W_CALC); if (!w) return;
+    scopy(w->title, "Calculadora", sizeof w->title);
+    scopy(w->cdisp, "0", sizeof w->cdisp);
+    w->cval = 0; w->cacc = 0; w->cop = 0; w->cnew = 1;
+}
+static void calc_set_disp(struct window *w, long v) {
+    ksnprintf(w->cdisp, sizeof w->cdisp, "%ld", v);
+}
+static void calc_apply(struct window *w) {
+    if (!w->cop) { w->cacc = w->cval; return; }
+    switch (w->cop) {
+    case '+': w->cacc += w->cval; break;
+    case '-': w->cacc -= w->cval; break;
+    case '*': w->cacc *= w->cval; break;
+    case '/': if (w->cval != 0) w->cacc /= w->cval; else w->cacc = 0; break;
+    }
+    w->cval = w->cacc;
+    calc_set_disp(w, w->cval);
+}
+static long calc_parse(const char *s) {
+    long v = 0; int neg = 0, i = 0;
+    if (s[0] == '-') { neg = 1; i = 1; }
+    while (s[i] >= '0' && s[i] <= '9') v = v * 10 + (s[i++] - '0');
+    return neg ? -v : v;
+}
+static void calc_key(struct window *w, const struct event *e) {
+    int k = e->key;
+    if (k >= '0' && k <= '9') {
+        if (w->cnew) { w->cdisp[0] = 0; w->cnew = 0; }
+        int n = (int)strlen(w->cdisp);
+        if (n < 14) { w->cdisp[n] = (char)k; w->cdisp[n + 1] = 0; }
+        w->cval = calc_parse(w->cdisp);
+    } else if (k == '+' || k == '-' || k == '*' || k == '/') {
+        calc_apply(w); w->cop = (char)k; w->cnew = 1;
+    } else if (k == '\n' || k == '=') {
+        calc_apply(w); w->cop = 0; w->cnew = 1;
+    } else if (k == 'c' || k == 'C' || k == 27) {
+        w->cval = w->cacc = 0; w->cop = 0; w->cnew = 1; scopy(w->cdisp, "0", sizeof w->cdisp);
+    } else if (k == '\b') {
+        int n = (int)strlen(w->cdisp);
+        if (n > 1) { w->cdisp[n - 1] = 0; w->cval = calc_parse(w->cdisp); }
+        else { scopy(w->cdisp, "0", sizeof w->cdisp); w->cval = 0; w->cnew = 1; }
+    }
+}
+static void draw_calc(struct surf *s, struct window *w) {
+    int bx = w->x + 10, by = w->y + TITLEH + 8;
+    rect(s, w->x + 2, w->y + TITLEH + 2, w->w - 4, w->h - TITLEH - 4, 0x00D4D0C8);
+    /* display */
+    rect(s, bx, by, w->w - 20, 28, 0x00FFFFFF);
+    frame(s, bx, by, w->w - 20, 28, 0x00808080);
+    int len = (int)strlen(w->cdisp);
+    text(s, bx + w->w - 28 - 8 * len, by + 10, w->cdisp, 0x00000000, 16);
+    /* buttons */
+    static const char *labs[] = { "7","8","9","/","4","5","6","*","1","2","3","-","0","C","=","+" };
+    for (int i = 0; i < 16; i++) {
+        int col = i % 4, row = i / 4;
+        int x = bx + col * 48, y = by + 40 + row * 42;
+        rect(s, x, y, 44, 36, 0x00E8E4D8);
+        frame(s, x, y, 44, 36, 0x00A0A0A0);
+        text(s, x + 16, y + 14, labs[i], 0x00000000, 2);
+    }
+}
+
+/* ---- Snake ---- */
+static void snake_place_food(struct window *w) {
+    for (int tries = 0; tries < 200; tries++) {
+        int fx = (tick * 7 + tries * 13) % 18 + 1;
+        int fy = (tick * 11 + tries * 17) % 14 + 1;
+        int ok = 1;
+        for (int i = 0; i < w->sn; i++) if (w->sx[i] == fx && w->sy[i] == fy) { ok = 0; break; }
+        if (ok) { w->sfoodx = fx; w->sfoody = fy; return; }
+    }
+    w->sfoodx = 10; w->sfoody = 8;
+}
+static void snake_reset(struct window *w) {
+    w->sn = 3; w->sx[0] = 5; w->sy[0] = 7; w->sx[1] = 4; w->sy[1] = 7; w->sx[2] = 3; w->sy[2] = 7;
+    w->sdir = 1; w->sscore = 0; w->sdead = 0; w->stick = 0;
+    snake_place_food(w);
+}
+static void snake_open(void) {
+    struct window *w = new_win(W_SNAKE); if (!w) return;
+    scopy(w->title, "Snake", sizeof w->title);
+    snake_reset(w);
+}
+static void snake_step(struct window *w) {
+    if (w->sdead) return;
+    int nx = w->sx[0], ny = w->sy[0];
+    if (w->sdir == 0) ny--; else if (w->sdir == 1) nx++; else if (w->sdir == 2) ny++; else nx--;
+    if (nx < 0 || nx >= 20 || ny < 0 || ny >= 16) { w->sdead = 1; return; }
+    for (int i = 0; i < w->sn; i++) if (w->sx[i] == nx && w->sy[i] == ny) { w->sdead = 1; return; }
+    for (int i = w->sn; i > 0; i--) { w->sx[i] = w->sx[i - 1]; w->sy[i] = w->sy[i - 1]; }
+    w->sx[0] = nx; w->sy[0] = ny;
+    if (nx == w->sfoodx && ny == w->sfoody) {
+        w->sn++; if (w->sn > 250) w->sn = 250;
+        w->sscore += 10;
+        snake_place_food(w);
+    }
+}
+static void snake_key(struct window *w, const struct event *e) {
+    int k = e->key;
+    if (w->sdead && (k == '\n' || k == 'r' || k == 'R')) { snake_reset(w); return; }
+    if (k == KEY_UP    && w->sdir != 2) w->sdir = 0;
+    else if (k == KEY_RIGHT && w->sdir != 3) w->sdir = 1;
+    else if (k == KEY_DOWN  && w->sdir != 0) w->sdir = 2;
+    else if (k == KEY_LEFT  && w->sdir != 1) w->sdir = 3;
+}
+static void draw_snake(struct surf *s, struct window *w) {
+    int cell = 18, ox = w->x + 20, oy = w->y + TITLEH + 20;
+    rect(s, w->x + 2, w->y + TITLEH + 2, w->w - 4, w->h - TITLEH - 4, 0x00102010);
+    /* grid */
+    for (int y = 0; y < 16; y++)
+        for (int x = 0; x < 20; x++)
+            rect(s, ox + x * cell, oy + y * cell, cell - 1, cell - 1, 0x00203020);
+    /* food */
+    rect(s, ox + w->sfoodx * cell, oy + w->sfoody * cell, cell - 1, cell - 1, 0x00E04040);
+    /* snake */
+    for (int i = 0; i < w->sn; i++) {
+        u32 col = i == 0 ? 0x0040E060 : 0x0020A040;
+        rect(s, ox + w->sx[i] * cell, oy + w->sy[i] * cell, cell - 1, cell - 1, col);
+    }
+    char b[48]; ksnprintf(b, sizeof b, "Puntos: %d", w->sscore);
+    text(s, w->x + 12, w->y + w->h - 18, b, 0x00FFFFFF, 20);
+    if (w->sdead) text_shadow(s, w->x + 100, w->y + TITLEH + 140, "GAME OVER - R para reiniciar", 0x00FF6060, 30);
+}
+
+/* ---- Tetris ---- */
+static const int tetrominoes[7][4][4] = {
+    {{0,0,0,0},{1,1,1,1},{0,0,0,0},{0,0,0,0}}, /* I */
+    {{1,1,0,0},{1,1,0,0},{0,0,0,0},{0,0,0,0}}, /* O */
+    {{0,1,0,0},{1,1,1,0},{0,0,0,0},{0,0,0,0}}, /* T */
+    {{0,1,1,0},{1,1,0,0},{0,0,0,0},{0,0,0,0}}, /* S */
+    {{1,1,0,0},{0,1,1,0},{0,0,0,0},{0,0,0,0}}, /* Z */
+    {{1,0,0,0},{1,1,1,0},{0,0,0,0},{0,0,0,0}}, /* J */
+    {{0,0,1,0},{1,1,1,0},{0,0,0,0},{0,0,0,0}}, /* L */
+};
+static const u32 tcolors[8] = {
+    0, 0x00F0F000, 0x00F0A000, 0x00A000F0, 0x0000F000, 0x00F00000, 0x000000F0, 0x00F08000
+};
+static void tetris_new_piece(struct window *w) {
+    w->tnext = (tick * 3 + w->tscore) % 7;
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) w->tcur[r][c] = tetrominoes[w->tnext][r][c] ? (w->tnext + 1) : 0;
+    w->tpx = 3; w->tpy = 0;
+    /* check game over */
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++)
+        if (w->tcur[r][c] && w->tboard[w->tpy + r][w->tpx + c]) { w->tgameover = 1; return; }
+}
+static void tetris_reset(struct window *w) {
+    memset(w->tboard, 0, sizeof w->tboard);
+    w->tscore = 0; w->tlines = 0; w->tlevel = 1; w->ttick = 0; w->tgameover = 0;
+    tetris_new_piece(w);
+}
+static void tetris_open(void) {
+    struct window *w = new_win(W_TETRIS); if (!w) return;
+    scopy(w->title, "Tetris", sizeof w->title);
+    tetris_reset(w);
+}
+static int tetris_valid(struct window *w, int px, int py, int rot[4][4]) {
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) {
+        if (!rot[r][c]) continue;
+        int x = px + c, y = py + r;
+        if (x < 0 || x >= 10 || y >= 20) return 0;
+        if (y >= 0 && w->tboard[y][x]) return 0;
+    }
+    return 1;
+}
+static void tetris_rotate(struct window *w) {
+    int tmp[4][4];
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) tmp[c][3 - r] = w->tcur[r][c];
+    if (tetris_valid(w, w->tpx, w->tpy, tmp))
+        for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) w->tcur[r][c] = tmp[r][c];
+}
+static void tetris_lock(struct window *w) {
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++)
+        if (w->tcur[r][c] && w->tpy + r >= 0) w->tboard[w->tpy + r][w->tpx + c] = w->tcur[r][c];
+    /* clear lines */
+    int cleared = 0;
+    for (int y = 19; y >= 0; y--) {
+        int full = 1;
+        for (int x = 0; x < 10; x++) if (!w->tboard[y][x]) { full = 0; break; }
+        if (full) {
+            cleared++;
+            for (int yy = y; yy > 0; yy--) for (int x = 0; x < 10; x++) w->tboard[yy][x] = w->tboard[yy - 1][x];
+            for (int x = 0; x < 10; x++) w->tboard[0][x] = 0;
+            y++;
+        }
+    }
+    if (cleared) {
+        w->tlines += cleared;
+        w->tscore += cleared * cleared * 100 * w->tlevel;
+        w->tlevel = 1 + w->tlines / 10;
+    }
+    tetris_new_piece(w);
+}
+static void tetris_step(struct window *w) {
+    if (w->tgameover) return;
+    if (tetris_valid(w, w->tpx, w->tpy + 1, w->tcur)) w->tpy++;
+    else tetris_lock(w);
+}
+static void tetris_key(struct window *w, const struct event *e) {
+    int k = e->key;
+    if (w->tgameover && (k == '\n' || k == 'r' || k == 'R')) { tetris_reset(w); return; }
+    if (k == KEY_LEFT  && tetris_valid(w, w->tpx - 1, w->tpy, w->tcur)) w->tpx--;
+    else if (k == KEY_RIGHT && tetris_valid(w, w->tpx + 1, w->tpy, w->tcur)) w->tpx++;
+    else if (k == KEY_DOWN) tetris_step(w);
+    else if (k == KEY_UP || k == 'x' || k == 'X') tetris_rotate(w);
+    else if (k == ' ') { while (tetris_valid(w, w->tpx, w->tpy + 1, w->tcur)) w->tpy++; tetris_lock(w); }
+}
+static void draw_tetris(struct surf *s, struct window *w) {
+    int cell = 16, ox = w->x + 20, oy = w->y + TITLEH + 12;
+    rect(s, w->x + 2, w->y + TITLEH + 2, w->w - 4, w->h - TITLEH - 4, 0x00101820);
+    frame(s, ox - 2, oy - 2, 10 * cell + 4, 20 * cell + 4, 0x006080A0);
+    for (int y = 0; y < 20; y++) for (int x = 0; x < 10; x++) {
+        u32 col = w->tboard[y][x] ? tcolors[w->tboard[y][x]] : 0x00081828;
+        rect(s, ox + x * cell, oy + y * cell, cell - 1, cell - 1, col);
+    }
+    if (!w->tgameover)
+        for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++)
+            if (w->tcur[r][c] && w->tpy + r >= 0)
+                rect(s, ox + (w->tpx + c) * cell, oy + (w->tpy + r) * cell, cell - 1, cell - 1, tcolors[w->tcur[r][c]]);
+    char b[48];
+    ksnprintf(b, sizeof b, "Pts %d", w->tscore); text(s, ox, oy + 20 * cell + 8, b, 0x00FFFFFF, 16);
+    ksnprintf(b, sizeof b, "Lin %d  Nv %d", w->tlines, w->tlevel); text(s, ox, oy + 20 * cell + 20, b, 0x00C0C0FF, 18);
+    if (w->tgameover) text_shadow(s, ox + 8, oy + 140, "GAME OVER", 0x00FF4040, 12);
+}
+
+/* ---- Race (pseudo-3D simple / top-down road) ---- */
+static void race_spawn(struct window *w) {
+    for (int i = 0; i < 8; i++) {
+        w->robstx[i] = 40 + ((tick + i * 37) % 200);
+        w->robsty[i] = -40 - i * 70 - ((tick * 3) % 50);
+        w->robstw[i] = 20 + (i % 3) * 10;
+    }
+}
+static void race_reset(struct window *w) {
+    w->rxpos = 200; w->rscore = 0; w->rspeed = 4; w->rtick = 0; w->rlives = 3; w->rdead = 0;
+    race_spawn(w);
+}
+static void race_open(void) {
+    struct window *w = new_win(W_RACE); if (!w) return;
+    scopy(w->title, "Kuno Rally 3D", sizeof w->title);
+    race_reset(w);
+}
+static void race_step(struct window *w) {
+    if (w->rdead) return;
+    w->rtick++;
+    w->rscore += w->rspeed / 2;
+    if (w->rtick % 200 == 0 && w->rspeed < 12) w->rspeed++;
+    for (int i = 0; i < 8; i++) {
+        w->robsty[i] += w->rspeed;
+        if (w->robsty[i] > 320) {
+            w->robsty[i] = -30 - (i * 20);
+            w->robstx[i] = 30 + ((tick * 17 + i * 41) % 360);
+            w->robstw[i] = 18 + (i % 4) * 8;
+        }
+        /* collision */
+        int cx = w->rxpos, cy = 280;
+        if (w->robsty[i] + 20 > cy && w->robsty[i] < cy + 30 &&
+            w->robstx[i] < cx + 24 && w->robstx[i] + w->robstw[i] > cx) {
+            w->rlives--;
+            w->robsty[i] = -40;
+            if (w->rlives <= 0) w->rdead = 1;
+        }
+    }
+}
+static void race_key(struct window *w, const struct event *e) {
+    int k = e->key;
+    if (w->rdead && (k == '\n' || k == 'r' || k == 'R')) { race_reset(w); return; }
+    if (k == KEY_LEFT)  { w->rxpos -= 12; if (w->rxpos < 20) w->rxpos = 20; }
+    else if (k == KEY_RIGHT) { w->rxpos += 12; if (w->rxpos > 400) w->rxpos = 400; }
+    else if (k == KEY_UP) w->rspeed = w->rspeed < 14 ? w->rspeed + 1 : 14;
+    else if (k == KEY_DOWN) w->rspeed = w->rspeed > 2 ? w->rspeed - 1 : 2;
+}
+static void draw_race(struct surf *s, struct window *w) {
+    int ox = w->x + 10, oy = w->y + TITLEH + 6;
+    int rw = w->w - 20, rh = w->h - TITLEH - 30;
+    /* sky / road perspective gradient */
+    for (int y = 0; y < rh; y++) {
+        int t = y * 255 / (rh ? rh : 1);
+        u32 sky = (0x40 + t / 4) << 16 | (0x80 + t / 3) << 8 | (0xC0 + t / 5);
+        if (y > rh * 2 / 5) {
+            int road = 0x00303030 + ((y & 4) ? 0x00080808 : 0);
+            rect(s, ox, oy + y, rw, 1, road);
+            /* side grass */
+            rect(s, ox, oy + y, 30 + (rh - y) / 8, 1, 0x00206020);
+            rect(s, ox + rw - 30 - (rh - y) / 8, oy + y, 30 + (rh - y) / 8, 1, 0x00206020);
+        } else rect(s, ox, oy + y, rw, 1, sky);
+    }
+    /* center line dashes moving */
+    for (int y = (w->rtick * w->rspeed) % 40; y < rh; y += 40)
+        if (y > rh * 2 / 5) rect(s, ox + rw / 2 - 3, oy + y, 6, 16, 0x00E0E0A0);
+    /* obstacles (cars) */
+    for (int i = 0; i < 8; i++) {
+        int y = w->robsty[i];
+        if (y < 0 || y > rh - 20) continue;
+        int x = w->robstx[i];
+        rect(s, ox + x, oy + y, w->robstw[i], 18, 0x00C02020);
+        rect(s, ox + x + 2, oy + y + 4, w->robstw[i] - 4, 6, 0x00404080); /* windshield */
+    }
+    /* player car */
+    int px = w->rxpos, py = rh - 50;
+    rect(s, ox + px, oy + py, 28, 36, 0x0020A0E0);
+    rect(s, ox + px + 4, oy + py + 6, 20, 10, 0x00A0D0FF);
+    rect(s, ox + px + 2, oy + py + 28, 8, 6, 0x00202020);
+    rect(s, ox + px + 18, oy + py + 28, 8, 6, 0x00202020);
+    /* HUD */
+    char b[64];
+    ksnprintf(b, sizeof b, "Pts %d  Vel %d  Vidas %d", w->rscore, w->rspeed, w->rlives);
+    text(s, ox + 8, oy + rh + 4, b, 0x00FFFFFF, 36);
+    if (w->rdead) text_shadow(s, ox + 120, oy + rh / 2, "CRASH! R = reiniciar", 0x00FF4040, 24);
+}
+
+/* ---- about / control ---- */
+static void draw_about(struct surf *s, struct window *w) {
+    char b[96]; int x = w->x + 14, y = w->y + TITLEH + 12;
+    rect(s, w->x + 2, w->y + TITLEH + 2, w->w - 4, w->h - TITLEH - 4, 0x00ECE9D8);
+    text(s, x, y, "KUNO 0.3  -  Kernel estilo Windows XP", 0x00000080, 44); y += 18;
+    ksnprintf(b, sizeof b, "Memoria: %llu MiB    GPUs: %d    Raton: %s",
+              kmem_bytes >> 20, ngpus, mouse_present ? "Si" : "No");
+    text(s, x, y, b, 0x00000000, 48); y += 16;
+    static const char *help[] = {
+        "Escritorio: haz clic en los iconos",
+        "Alt+Tab  cambiar ventana",
+        "Alt+T    terminal   Alt+F  archivos",
+        "Alt+C    calculadora",
+        "Alt+S    Snake      Alt+R  Tetris",
+        "Alt+G    juego de coches",
+        "Alt+M    maximizar  Alt+F4 cerrar",
+        "Raton: arrastrar titulo, [X] cierra",
+        "Juegos: flechas / R reinicia"
+    };
+    for (unsigned i = 0; i < sizeof help / sizeof *help; i++, y += 14)
+        text(s, x, y, help[i], 0x00202020, 48);
+}
+static void draw_ctrl(struct surf *s, struct window *w) {
+    int x = w->x + 14, y = w->y + TITLEH + 12;
+    rect(s, w->x + 2, w->y + TITLEH + 2, w->w - 4, w->h - TITLEH - 4, 0x00ECE9D8);
+    text(s, x, y, "Panel de control", 0x00000080, 30); y += 18;
+    char b[80];
+    ksnprintf(b, sizeof b, "Resolucion: %ux%u", gpus[0] ? gpus[0]->w : 0, gpus[0] ? gpus[0]->h : 0);
+    text(s, x, y, b, 0x00000000, 40); y += 12;
+    ksnprintf(b, sizeof b, "Memoria: %llu MiB   GPUs: %d", kmem_bytes >> 20, ngpus);
+    text(s, x, y, b, 0x00000000, 40); y += 12;
+    ksnprintf(b, sizeof b, "Uptime: %llu s   jiffies: %llu", sched_jiffies() / 100, sched_jiffies());
+    text(s, x, y, b, 0x00000000, 44); y += 12;
+    ksnprintf(b, sizeof b, "Cambios de contexto: %llu", sched_switches());
+    text(s, x, y, b, 0x00000000, 40); y += 14;
+    text(s, x, y, "Tareas (preemptivo RR @ 100Hz):", 0x00000080, 40); y += 14;
+    for (int i = 0; i < 8; i++) {
+        char name[20]; int st; u64 tk, sw;
+        sched_task_info(i, name, sizeof name, &st, &tk, &sw);
+        if (st < 0) continue;
+        ksnprintf(b, sizeof b, " %d %-6s t=%llu sw=%llu %s", i, sched_state_str(st), tk, sw, name);
+        text(s, x, y, b, 0x00000000, 48); y += 12;
+    }
+    y += 4;
+    text(s, x, y, "FAT32 solo lectura  |  tema XP Luna", 0x00404080, 44);
+    /* forzar redibujo periodico para ver contadores vivos */
+    if ((sched_jiffies() & 7) == 0) dirty = 1;
+}
+
+/* ---------- iconos del escritorio ---------- */
+static void draw_icon(struct surf *s, int ix, int iy, const char *label, int kind) {
+    /* icon body */
+    u32 col = 0x00E0E0E0;
+    if (kind == W_TERM) col = 0x002060A0;
+    else if (kind == W_FILES) col = 0x00E0C040;
+    else if (kind == W_CALC) col = 0x00A0A0A0;
+    else if (kind == W_SNAKE) col = 0x0020A040;
+    else if (kind == W_TETRIS) col = 0x00A040C0;
+    else if (kind == W_RACE) col = 0x00C04020;
+    else if (kind == W_ABOUT) col = 0x004080C0;
+    else if (kind == W_CTRL) col = 0x00808060;
+    rect(s, ix + 8, iy + 4, 32, 28, col);
+    frame(s, ix + 8, iy + 4, 32, 28, 0x00000000);
+    /* small glyph inside */
+    glyph(s, ix + 20, iy + 12, label[0], 0x00FFFFFF);
+    /* label with shadow */
+    int len = (int)strlen(label);
+    int tx = ix + 24 - 4 * len;
+    if (tx < ix) tx = ix;
+    text_shadow(s, tx, iy + 38, label, 0x00FFFFFF, 12);
+}
+
+static void open_by_kind(int kind) {
+    switch (kind) {
+    case W_TERM:   term_open(); break;
+    case W_FILES:  files_open_win(); break;
+    case W_CALC:   calc_open(); break;
+    case W_SNAKE:  snake_open(); break;
+    case W_TETRIS: tetris_open(); break;
+    case W_RACE:   race_open(); break;
+    case W_ABOUT: {
+        for (int i = 0; i < MAXWIN; i++) if (wins[i].kind == W_ABOUT) { raise_win(&wins[i]); return; }
+        struct window *w = new_win(W_ABOUT);
+        if (w) scopy(w->title, "Acerca de Kuno", sizeof w->title);
+        break;
+    }
+    case W_CTRL: {
+        for (int i = 0; i < MAXWIN; i++) if (wins[i].kind == W_CTRL) { raise_win(&wins[i]); return; }
+        struct window *w = new_win(W_CTRL);
+        if (w) scopy(w->title, "Panel de control", sizeof w->title);
+        break;
+    }
+    }
+}
+
+/* ---------- render ---------- */
+static void draw_window(struct surf *s, struct window *w, int focused) {
+    /* XP-style chrome */
+    u32 title_col = focused ? 0x00005AA0 : 0x007A96B8;
+    u32 border = focused ? 0x00003C78 : 0x006080A0;
+    /* shadow */
+    rect(s, w->x + 3, w->y + 3, w->w, w->h, 0x00000040);
+    /* body */
+    rect(s, w->x, w->y, w->w, w->h, 0x00ECE9D8);
+    /* title bar gradient-ish */
+    rect(s, w->x, w->y, w->w, TITLEH, title_col);
+    rect(s, w->x, w->y + TITLEH - 2, w->w, 2, focused ? 0x00004888 : 0x006888A8);
+    frame(s, w->x, w->y, w->w, w->h, border);
+    text(s, w->x + 8, w->y + 7, w->title, 0x00FFFFFF, (w->w - 40) / 8);
+    /* close button */
+    rect(s, w->x + w->w - 20, w->y + 4, 14, 14, 0x00C04040);
+    frame(s, w->x + w->w - 20, w->y + 4, 14, 14, 0x00802020);
+    text(s, w->x + w->w - 17, w->y + 7, "X", 0x00FFFFFF, 1);
+    switch (w->kind) {
+    case W_TERM:   draw_term(s, w, focused); break;
+    case W_FILES:  draw_files(s, w); break;
+    case W_VIEW:   draw_view(s, w); break;
+    case W_ABOUT:  draw_about(s, w); break;
+    case W_CALC:   draw_calc(s, w); break;
+    case W_SNAKE:  draw_snake(s, w); break;
+    case W_TETRIS: draw_tetris(s, w); break;
+    case W_RACE:   draw_race(s, w); break;
+    case W_CTRL:   draw_ctrl(s, w); break;
+    }
+}
+
+static void draw_desktop(struct surf *s) {
+    /* Bliss-like gradient (sky blue -> green) */
+    for (int y = 0; y < s->h - TASKH; y++) {
+        int t = y * 255 / (s->h - TASKH ? s->h - TASKH : 1);
+        u32 c;
+        if (t < 140) {
+            /* sky */
+            int r = 0x30 + t / 4, g = 0x80 + t / 3, b = 0xC8 + t / 8;
+            c = (r << 16) | (g << 8) | b;
+        } else {
+            /* grass / hill */
+            int r = 0x20 + (t - 140) / 6, g = 0x70 + (t - 140) / 4, b = 0x20;
+            c = (r << 16) | (g << 8) | b;
+        }
+        rect(s, 0, y, s->w, 1, c);
+    }
+    /* icons */
+    for (int i = 0; i < NICONS; i++)
+        draw_icon(s, icons[i].x, icons[i].y, icons[i].label, icons[i].kind);
+}
+
+static void draw_taskbar(struct surf *s) {
+    int ty = s->h - TASKH;
+    /* XP green taskbar */
+    rect(s, 0, ty, s->w, TASKH, 0x00208030);
+    rect(s, 0, ty, s->w, 2, 0x0040B050);
+    /* Start button */
+    rect(s, 4, ty + 4, 70, 22, 0x0030A040);
+    frame(s, 4, ty + 4, 70, 22, 0x0060C070);
+    text(s, 14, ty + 10, "Inicio", 0x00FFFFFF, 8);
+    /* quick launch */
+    static const struct { int x, w; const char *l; int kind; } btn[] = {
+        { 82, 52, "Term", W_TERM }, { 138, 52, "Files", W_FILES },
+        { 194, 44, "Calc", W_CALC }, { 242, 44, "Snake", W_SNAKE },
+        { 290, 48, "Tetris", W_TETRIS }, { 342, 48, "Race", W_RACE }
+    };
+    for (int i = 0; i < 6; i++) {
+        rect(s, btn[i].x, ty + 5, btn[i].w, 20, 0x00287030);
+        text(s, btn[i].x + 6, ty + 10, btn[i].l, 0x00FFFFFF, 8);
+    }
+    /* window buttons */
+    int bx = 400;
+    for (int i = 0; i < MAXWIN; i++) if (wins[i].kind != W_NONE) {
+        int active = nz && z[nz - 1] == &wins[i];
+        rect(s, bx, ty + 4, 100, 22, active ? 0x0040A050 : 0x00286028);
+        text(s, bx + 6, ty + 10, wins[i].title, 0x00FFFFFF, 11);
+        bx += 104;
+        if (bx > s->w - 120) break;
+    }
+    /* reloj en tiempo real (uptime del PIT a 100 Hz) */
+    {
+        u64 sec = sched_jiffies() / 100;
+        u32 h = (u32)((sec / 3600) % 24), m = (u32)((sec / 60) % 60), s2 = (u32)(sec % 60);
+        char clk[16];
+        ksnprintf(clk, sizeof clk, "%02u:%02u:%02u", h, m, s2);
+        rect(s, s->w - 88, ty + 4, 82, 22, 0x00186020);
+        text(s, s->w - 80, ty + 10, clk, 0x00FFFFFF, 10);
+    }
+}
+
+static void render(struct surf *s) {
+    draw_desktop(s);
+    for (int i = 0; i < nz; i++) draw_window(s, z[i], i == nz - 1);
+    draw_taskbar(s);
+    if (start_open) {
+        /* simple start menu */
+        int sx = 4, sy = s->h - TASKH - 220;
+        rect(s, sx, sy, 160, 216, 0x00ECE9D8);
+        frame(s, sx, sy, 160, 216, 0x00005AA0);
+        rect(s, sx, sy, 160, 24, 0x00005AA0);
+        text(s, sx + 8, sy + 8, "Menu Inicio", 0x00FFFFFF, 14);
+        static const char *items[] = { "Terminal", "Archivos", "Calculadora", "Snake", "Tetris", "Coches 3D", "Sistema", "Panel control" };
+        static const int kinds[] = { W_TERM, W_FILES, W_CALC, W_SNAKE, W_TETRIS, W_RACE, W_ABOUT, W_CTRL };
+        for (int i = 0; i < 8; i++) {
+            text(s, sx + 12, sy + 32 + i * 22, items[i], 0x00000000, 16);
+            (void)kinds;
+        }
+    }
+    draw_cursor(s);
+}
+
+void gui_frame(void) {
+    tick++;
+    /* avanzar juegos segun jiffies del PIT (independiente del polling) */
+    static u64 last_jiff;
+    u64 j = sched_jiffies();
+    int any_game = 0;
+    if (j != last_jiff) {
+        last_jiff = j;
+        for (int i = 0; i < MAXWIN; i++) {
+            if (wins[i].kind == W_SNAKE && !wins[i].sdead) {
+                wins[i].stick++;
+                if (wins[i].stick >= 8) { wins[i].stick = 0; snake_step(&wins[i]); any_game = 1; }
+            }
+            if (wins[i].kind == W_TETRIS && !wins[i].tgameover) {
+                wins[i].ttick++;
+                int speed = 14 - wins[i].tlevel; if (speed < 4) speed = 4;
+                if (wins[i].ttick >= speed) { wins[i].ttick = 0; tetris_step(&wins[i]); any_game = 1; }
+            }
+            if (wins[i].kind == W_RACE && !wins[i].rdead) {
+                wins[i].rtick++;
+                if ((wins[i].rtick & 1) == 0) { race_step(&wins[i]); any_game = 1; }
+            }
+        }
+        /* reloj: forzar redibujo cada segundo */
+        if ((j % 25) == 0) any_game = 1;
+    }
+    if (any_game) dirty = 1;
+    if (!dirty) return;
+    dirty = 0;
+    for (int i = 0; i < ngpus; i++) {
+        struct gpu *g = gpus[i]; struct surf *s = &surfs[i];
+        if (!s->px) { s->px = kmalloc((size_t)g->w * g->h * 4); s->w = (int)g->w; s->h = (int)g->h; }
+        render(s);
+        for (int y = 0; y < s->h; y++)
+            memcpy(g->fb + (size_t)y * g->pitch, s->px + (size_t)y * s->w, (size_t)s->w * 4);
+    }
+}
+
+/* ---------- entrada ---------- */
+static void toggle_max(struct window *w) {
+    int sw = (int)gpus[0]->w, sh = (int)gpus[0]->h;
+    if (!w->maxed) {
+        w->rx = w->x; w->ry = w->y; w->rw = w->w; w->rh = w->h;
+        w->x = w->y = 0; w->w = sw; w->h = sh - TASKH; w->maxed = 1;
+    } else {
+        w->x = w->rx; w->y = w->ry; w->w = w->rw; w->h = w->rh; w->maxed = 0;
+    }
+}
+static int wm_key(const struct event *e) {
+    struct window *top = nz ? z[nz - 1] : 0;
+    switch (e->key) {
+    case '\t':
+        if (nz > 1) {
+            struct window *b = z[0];
+            for (int i = 0; i + 1 < nz; i++) z[i] = z[i + 1];
+            z[nz - 1] = b;
+        }
+        return 1;
+    case 't': case 'T': term_open(); return 1;
+    case 'f': case 'F': files_open_win(); return 1;
+    case 'c': case 'C': calc_open(); return 1;
+    case 's': case 'S': snake_open(); return 1;
+    case 'r': case 'R': tetris_open(); return 1;
+    case 'g': case 'G': race_open(); return 1;
+    case 'i': case 'I': {
+        int have = 0;
+        for (int i = 0; i < MAXWIN; i++) if (wins[i].kind == W_ABOUT) { raise_win(&wins[i]); have = 1; }
+        if (!have) { struct window *w = new_win(W_ABOUT); if (w) scopy(w->title, "Acerca de Kuno", sizeof w->title); }
+        return 1;
+    }
+    case 'p': case 'P': {
+        int have = 0;
+        for (int i = 0; i < MAXWIN; i++) if (wins[i].kind == W_CTRL) { raise_win(&wins[i]); have = 1; }
+        if (!have) { struct window *w = new_win(W_CTRL); if (w) scopy(w->title, "Panel de control", sizeof w->title); }
+        return 1;
+    }
+    case 'm': case 'M': if (top) toggle_max(top); return 1;
+    case KEY_F1 + 3: if (top) close_win(top); return 1; /* F4 */
+    case KEY_LEFT:  if (top && !top->maxed) top->x -= 16; return 1;
+    case KEY_RIGHT: if (top && !top->maxed) top->x += 16; return 1;
+    case KEY_UP:    if (top && !top->maxed) top->y -= 16; return 1;
+    case KEY_DOWN:  if (top && !top->maxed) top->y += 16; return 1;
+    }
+    return 0;
+}
+
+static void taskbar_click(int x) {
+    int ty = 0; (void)ty;
+    if (x >= 4 && x < 74) { start_open = !start_open; dirty = 1; return; }
+    if (x >= 82 && x < 134) term_open();
+    else if (x >= 138 && x < 190) files_open_win();
+    else if (x >= 194 && x < 238) calc_open();
+    else if (x >= 242 && x < 286) snake_open();
+    else if (x >= 290 && x < 338) tetris_open();
+    else if (x >= 342 && x < 390) race_open();
+    else if (x >= 400) {
+        int idx = (x - 400) / 104;
+        for (int i = 0; i < MAXWIN; i++) if (wins[i].kind != W_NONE && idx-- == 0) { raise_win(&wins[i]); break; }
+    }
+    start_open = 0;
+}
+
+static void desktop_click(int x, int y) {
+    for (int i = 0; i < NICONS; i++) {
+        int ix = icons[i].x, iy = icons[i].y;
+        if (x >= ix && x < ix + ICON_W && y >= iy && y < iy + ICON_H) {
+            open_by_kind(icons[i].kind);
+            start_open = 0;
+            return;
+        }
+    }
+    if (start_open) {
+        int sx = 4, sy = (int)gpus[0]->h - TASKH - 220;
+        if (x >= sx && x < sx + 160 && y >= sy + 28 && y < sy + 210) {
+            int row = (y - (sy + 28)) / 22;
+            static const int kinds[] = { W_TERM, W_FILES, W_CALC, W_SNAKE, W_TETRIS, W_RACE, W_ABOUT, W_CTRL };
+            if (row >= 0 && row < 8) open_by_kind(kinds[row]);
+        }
+        start_open = 0;
+    }
+}
+
+static void mouse_event(const struct event *e) {
+    int sw = (int)gpus[0]->w, sh = (int)gpus[0]->h;
+    mx += e->dx; my += e->dy;
+    if (mx < 0) mx = 0;
+    if (my < 0) my = 0;
+    if (mx >= sw) mx = sw - 1;
+    if (my >= sh) my = sh - 1;
+    int down = e->buttons & 1, pressed = down && !(mbtn & 1);
+    mbtn = e->buttons;
+    if (dragging) {
+        if (down) {
+            dragging->x = mx - drag_dx; dragging->y = my - drag_dy;
+            if (dragging->y < 0) dragging->y = 0;
+        } else dragging = 0;
+        return;
+    }
+    if (!pressed) return;
+    if (my >= sh - TASKH) { taskbar_click(mx); return; }
+    for (int i = nz - 1; i >= 0; i--) {
+        struct window *w = z[i];
+        if (mx < w->x || mx >= w->x + w->w || my < w->y || my >= w->y + w->h) continue;
+        raise_win(w);
+        if (my < w->y + TITLEH) {
+            if (mx >= w->x + w->w - 22) close_win(w);
+            else if (!w->maxed) { dragging = w; drag_dx = mx - w->x; drag_dy = my - w->y; }
+        } else if (w->kind == W_FILES) {
+            int row = (my - (w->y + TITLEH + 6)) / 10 + w->top;
+            if (row >= 0 && row < w->nent) {
+                if (row == w->sel) files_activate(w);
+                else w->sel = row;
+            }
+        } else if (w->kind == W_CALC) {
+            /* simple button hit for calc */
+            int bx = w->x + 10, by = w->y + TITLEH + 48;
+            int col = (mx - bx) / 48, row = (my - by) / 42;
+            if (col >= 0 && col < 4 && row >= 0 && row < 4) {
+                static const char map[] = "789/456*123-0C=+";
+                char ch = map[row * 4 + col];
+                struct event ke = { EV_KEY, 1, 0, 0, ch == '=' ? '\n' : ch, 0, 0 };
+                calc_key(w, &ke);
+            }
+        }
+        start_open = 0;
+        return;
+    }
+    desktop_click(mx, my);
+}
+
+void gui_handle(const struct event *e) {
+    dirty = 1;
+    if (e->type == EV_MOUSE) { if (ngpus) mouse_event(e); return; }
+    if (!e->down) return;
+    if ((e->mods & (MOD_ALT | MOD_SUPER)) && wm_key(e)) return;
+    if (!nz) return;
+    struct window *w = z[nz - 1];
+    switch (w->kind) {
+    case W_TERM:   term_key(w, e); break;
+    case W_FILES:  files_key(w, e); break;
+    case W_VIEW:   view_key(w, e); break;
+    case W_CALC:   calc_key(w, e); break;
+    case W_SNAKE:  snake_key(w, e); break;
+    case W_TETRIS: tetris_key(w, e); break;
+    case W_RACE:   race_key(w, e); break;
+    default: break;
+    }
+}
+
+void gui_init(struct fat32 *fs) {
+    g_fs = fs;
+    mx = (int)gpus[0]->w / 2; my = (int)gpus[0]->h / 2;
+    /* welcome window */
+    struct window *a = new_win(W_ABOUT);
+    if (a) {
+        scopy(a->title, "Bienvenido a Kuno 0.3", sizeof a->title);
+        a->x = (int)gpus[0]->w - 460; a->y = 40;
+    }
+    dirty = 1;
+}
