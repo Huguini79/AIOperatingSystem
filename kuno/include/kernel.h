@@ -9,6 +9,7 @@ void *memset(void *, int, size_t);
 int   memcmp(const void *, const void *, size_t);
 void *memmove(void *, const void *, size_t);
 size_t strlen(const char *);
+int   strcmp(const char *, const char *);
 
 void kprintf(const char *fmt, ...);
 int  ksnprintf(char *buf, size_t n, const char *fmt, ...);
@@ -66,7 +67,6 @@ void gpu_pci_found(u8 bus, u8 dev, u8 fn, u16 vendor, u16 device, u32 bar0);
 void pci_scan(void);
 
 /* ---- GUI ---- */
-void gui_render(struct gpu *g);
 void klog_push(char c);
 const char *klog_line(int i);
 #define KLOG_LINES 40
@@ -79,3 +79,35 @@ const char *klog_line(int i);
 #define SYS_exit 60
 void  vfs_set_root(struct fat32 *fs);
 long  ksyscall(long no, long a1, long a2, long a3);
+
+/* ---- entrada: teclado y raton PS/2 ---- */
+#define MOD_SHIFT 1
+#define MOD_CTRL  2
+#define MOD_ALT   4
+#define MOD_SUPER 8
+enum { KEY_UP = 0x101, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_HOME, KEY_END, KEY_PGUP, KEY_PGDN,
+       KEY_DEL, KEY_INS, KEY_F1 = 0x110 /* ..KEY_F1+11 = F12 */ };
+enum { EV_KEY, EV_MOUSE };
+struct event { u8 type, down, buttons; u16 mods; int key, dx, dy; };
+struct kbd   { u8 ext, skip, held, caps; };
+struct mouse { u8 n; u8 pkt[3]; };
+int  kbd_decode(struct kbd *k, u8 byte, struct event *ev);      /* 1 si genera evento */
+int  mouse_decode(struct mouse *m, u8 byte, struct event *ev);
+void ps2_init(void);
+void input_poll(void);
+int  ev_pop(struct event *e);
+extern int mouse_present;
+
+/* ---- shell ---- */
+struct shell { struct fat32 *fs; char cwd[128]; int want_clear, want_exit; };
+typedef void (*shell_out)(void *ctx, const char *s);
+void shell_init(struct shell *sh, struct fat32 *fs);
+void shell_exec(struct shell *sh, const char *line, shell_out out, void *ctx);
+int  path_resolve(const char *cwd, const char *arg, char *out, size_t n);
+extern u64 kmem_bytes;
+
+/* ---- GUI y consola de texto ---- */
+void gui_init(struct fat32 *fs);
+void gui_handle(const struct event *e);
+void gui_frame(void);
+void textcon_run(struct shell *sh);

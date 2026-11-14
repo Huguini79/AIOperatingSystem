@@ -1,18 +1,26 @@
 #include "kernel.h"
 
-void *memcpy(void *d, const void *s, size_t n) { u8 *a = d; const u8 *b = s; while (n--) *a++ = *b++; return d; }
+void *memcpy(void *d, const void *s, size_t n) {
+    void *r = d; size_t q = n >> 3; n &= 7;
+    __asm__ volatile("rep movsq" : "+D"(d), "+S"(s), "+c"(q) :: "memory");
+    __asm__ volatile("rep movsb" : "+D"(d), "+S"(s), "+c"(n) :: "memory");
+    return r;
+}
 void *memmove(void *d, const void *s, size_t n) {
     u8 *a = d; const u8 *b = s;
     if (a < b) while (n--) *a++ = *b++; else { a += n; b += n; while (n--) *--a = *--b; }
     return d;
 }
-void *memset(void *d, int c, size_t n) { u8 *a = d; while (n--) *a++ = (u8)c; return d; }
+void *memset(void *d, int c, size_t n) {
+    void *r = d; __asm__ volatile("rep stosb" : "+D"(d), "+c"(n) : "a"(c) : "memory"); return r;
+}
 int memcmp(const void *x, const void *y, size_t n) {
     const u8 *a = x, *b = y;
     for (; n; n--, a++, b++) if (*a != *b) return *a - *b;
     return 0;
 }
 size_t strlen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
+int strcmp(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return (u8)*a - (u8)*b; }
 
 /* ---- puerto serie COM1 ---- */
 static void serial_putc(char c) {
@@ -91,7 +99,7 @@ int ksnprintf(char *buf, size_t n, const char *fmt, ...) {
 }
 
 /* ---- asignador "bump" (sin free; suficiente para la fase 1) ---- */
-static u8 heap[8 << 20] __attribute__((aligned(4096)));
+static u8 heap[32 << 20] __attribute__((aligned(4096)));
 static size_t heap_off;
 void *kmalloc(size_t n) {
     n = (n + 15) & ~15UL;

@@ -1,0 +1,391 @@
+.text
+.globl fib
+fib:
+  push %rbp
+  mov %rsp,%rbp
+  sub $FRAME_fib,%rsp
+  mov %rdi,-8(%rbp)
+  mov -8(%rbp),%rax
+  push %rax
+  mov $2,%rax
+  mov %rax,%rcx
+  pop %rax
+  cmp %rcx,%rax
+  setl %al
+  movzb %al,%eax
+  cmp $0,%rax
+  je .L0
+  mov -8(%rbp),%rax
+  jmp .Lret_fib
+.L0:
+  mov -8(%rbp),%rax
+  push %rax
+  mov $1,%rax
+  mov %rax,%rcx
+  pop %rax
+  sub %rcx,%rax
+  push %rax
+  pop %rdi
+  xor %eax,%eax
+  call fib
+  push %rax
+  mov -8(%rbp),%rax
+  push %rax
+  mov $2,%rax
+  mov %rax,%rcx
+  pop %rax
+  sub %rcx,%rax
+  push %rax
+  pop %rdi
+  sub $8,%rsp
+  xor %eax,%eax
+  call fib
+  add $8,%rsp
+  mov %rax,%rcx
+  pop %rax
+  add %rcx,%rax
+  jmp .Lret_fib
+  xor %eax,%eax
+.Lret_fib:
+  leave
+  ret
+.set FRAME_fib,16
+
+.globl gcd
+gcd:
+  push %rbp
+  mov %rsp,%rbp
+  sub $FRAME_gcd,%rsp
+  mov %rdi,-8(%rbp)
+  mov %rsi,-16(%rbp)
+.L2:
+  mov -16(%rbp),%rax
+  push %rax
+  mov $0,%rax
+  mov %rax,%rcx
+  pop %rax
+  cmp %rcx,%rax
+  setne %al
+  movzb %al,%eax
+  cmp $0,%rax
+  je .L3
+  mov -16(%rbp),%rax
+  mov %rax,-24(%rbp)
+  mov -8(%rbp),%rax
+  push %rax
+  mov -16(%rbp),%rax
+  mov %rax,%rcx
+  pop %rax
+  cqo
+  idiv %rcx
+  mov %rdx,%rax
+  mov %rax,-16(%rbp)
+  mov -24(%rbp),%rax
+  mov %rax,-8(%rbp)
+  jmp .L2
+.L3:
+  mov -8(%rbp),%rax
+  jmp .Lret_gcd
+  xor %eax,%eax
+.Lret_gcd:
+  leave
+  ret
+.set FRAME_gcd,32
+
+.globl suma7
+suma7:
+  push %rbp
+  mov %rsp,%rbp
+  sub $FRAME_suma7,%rsp
+  mov %rdi,-8(%rbp)
+  mov %rsi,-16(%rbp)
+  mov %rdx,-24(%rbp)
+  mov %rcx,-32(%rbp)
+  mov %r8,-40(%rbp)
+  mov %r9,-48(%rbp)
+  mov -8(%rbp),%rax
+  push %rax
+  mov -16(%rbp),%rax
+  push %rax
+  mov $2,%rax
+  mov %rax,%rcx
+  pop %rax
+  imul %rcx,%rax
+  mov %rax,%rcx
+  pop %rax
+  add %rcx,%rax
+  push %rax
+  mov -24(%rbp),%rax
+  push %rax
+  mov $3,%rax
+  mov %rax,%rcx
+  pop %rax
+  imul %rcx,%rax
+  mov %rax,%rcx
+  pop %rax
+  add %rcx,%rax
+  push %rax
+  mov -32(%rbp),%rax
+  push %rax
+  mov $4,%rax
+  mov %rax,%rcx
+  pop %rax
+  imul %rcx,%rax
+  mov %rax,%rcx
+  pop %rax
+  add %rcx,%rax
+  push %rax
+  mov -40(%rbp),%rax
+  push %rax
+  mov $5,%rax
+  mov %rax,%rcx
+  pop %rax
+  imul %rcx,%rax
+  mov %rax,%rcx
+  pop %rax
+  add %rcx,%rax
+  push %rax
+  mov -48(%rbp),%rax
+  push %rax
+  mov $6,%rax
+  mov %rax,%rcx
+  pop %rax
+  imul %rcx,%rax
+  mov %rax,%rcx
+  pop %rax
+  add %rcx,%rax
+  jmp .Lret_suma7
+  xor %eax,%eax
+.Lret_suma7:
+  leave
+  ret
+.set FRAME_suma7,48
+
+.globl main
+main:
+  push %rbp
+  mov %rsp,%rbp
+  sub $FRAME_main,%rsp
+  mov $0,%rax
+  mov %rax,-8(%rbp)
+  mov $0,%rax
+  mov %rax,-16(%rbp)
+.L4:
+  mov -8(%rbp),%rax
+  push %rax
+  mov $10,%rax
+  mov %rax,%rcx
+  pop %rax
+  cmp %rcx,%rax
+  setl %al
+  movzb %al,%eax
+  cmp $0,%rax
+  je .L5
+  mov -8(%rbp),%rax
+  push %rax
+  pop %rdi
+  xor %eax,%eax
+  call fib
+  push %rax
+  pop %rdi
+  xor %eax,%eax
+  call putn
+  mov -8(%rbp),%rax
+  push %rax
+  mov $1,%rax
+  mov %rax,%rcx
+  pop %rax
+  add %rcx,%rax
+  mov %rax,-8(%rbp)
+  jmp .L4
+.L5:
+  mov $48,%rax
+  push %rax
+  mov $18,%rax
+  push %rax
+  pop %rsi
+  pop %rdi
+  xor %eax,%eax
+  call gcd
+  push %rax
+  pop %rdi
+  xor %eax,%eax
+  call putn
+  mov $7,%rax
+  neg %rax
+  push %rax
+  mov $2,%rax
+  mov %rax,%rcx
+  pop %rax
+  cqo
+  idiv %rcx
+  push %rax
+  mov $10,%rax
+  push %rax
+  mov $4,%rax
+  mov %rax,%rcx
+  pop %rax
+  cqo
+  idiv %rcx
+  mov %rdx,%rax
+  push %rax
+  mov $3,%rax
+  mov %rax,%rcx
+  pop %rax
+  imul %rcx,%rax
+  mov %rax,%rcx
+  pop %rax
+  add %rcx,%rax
+  push %rax
+  pop %rdi
+  xor %eax,%eax
+  call putn
+  mov $0,%rax
+  cmp $0,%rax
+  sete %al
+  movzb %al,%eax
+  push %rax
+  mov $5,%rax
+  cmp $0,%rax
+  sete %al
+  movzb %al,%eax
+  mov %rax,%rcx
+  pop %rax
+  add %rcx,%rax
+  push %rax
+  pop %rdi
+  xor %eax,%eax
+  call putn
+  mov $1,%rax
+  push %rax
+  mov $1,%rax
+  push %rax
+  mov $1,%rax
+  push %rax
+  mov $1,%rax
+  push %rax
+  mov $1,%rax
+  push %rax
+  mov $1,%rax
+  push %rax
+  pop %r9
+  pop %r8
+  pop %rcx
+  pop %rdx
+  pop %rsi
+  pop %rdi
+  xor %eax,%eax
+  call suma7
+  push %rax
+  pop %rdi
+  xor %eax,%eax
+  call putn
+  mov $1,%rax
+  push %rax
+  mov $1,%rax
+  push %rax
+  mov $2,%rax
+  push %rax
+  mov $3,%rax
+  push %rax
+  mov $4,%rax
+  push %rax
+  mov $5,%rax
+  push %rax
+  mov $6,%rax
+  push %rax
+  pop %r9
+  pop %r8
+  pop %rcx
+  pop %rdx
+  pop %rsi
+  pop %rdi
+  sub $8,%rsp
+  xor %eax,%eax
+  call suma7
+  add $8,%rsp
+  push %rax
+  mov $2,%rax
+  mov %rax,%rcx
+  pop %rax
+  imul %rcx,%rax
+  mov %rax,%rcx
+  pop %rax
+  add %rcx,%rax
+  push %rax
+  pop %rdi
+  xor %eax,%eax
+  call putn
+  mov $3,%rax
+  push %rax
+  mov $4,%rax
+  mov %rax,%rcx
+  pop %rax
+  cmp %rcx,%rax
+  setl %al
+  movzb %al,%eax
+  push %rax
+  mov $4,%rax
+  push %rax
+  mov $4,%rax
+  mov %rax,%rcx
+  pop %rax
+  cmp %rcx,%rax
+  setle %al
+  movzb %al,%eax
+  mov %rax,%rcx
+  pop %rax
+  add %rcx,%rax
+  push %rax
+  mov $5,%rax
+  push %rax
+  mov $5,%rax
+  mov %rax,%rcx
+  pop %rax
+  cmp %rcx,%rax
+  sete %al
+  movzb %al,%eax
+  mov %rax,%rcx
+  pop %rax
+  add %rcx,%rax
+  push %rax
+  mov $5,%rax
+  push %rax
+  mov $5,%rax
+  mov %rax,%rcx
+  pop %rax
+  cmp %rcx,%rax
+  setne %al
+  movzb %al,%eax
+  mov %rax,%rcx
+  pop %rax
+  add %rcx,%rax
+  push %rax
+  pop %rdi
+  xor %eax,%eax
+  call putn
+  mov -16(%rbp),%rax
+  cmp $0,%rax
+  je .L6
+  mov $111,%rax
+  push %rax
+  pop %rdi
+  xor %eax,%eax
+  call putn
+  jmp .L7
+.L6:
+  mov $222,%rax
+  push %rax
+  pop %rdi
+  xor %eax,%eax
+  call putn
+.L7:
+  mov $0,%rax
+  jmp .Lret_main
+  xor %eax,%eax
+.Lret_main:
+  leave
+  ret
+.set FRAME_main,16
+
+.section .note.GNU-stack,"",@progbits

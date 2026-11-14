@@ -24,6 +24,7 @@ mb2_end:
 .global _start
 _start:
     cli
+    cld
     mov $stack_top, %esp
     mov %eax, %edi                            /* magic Multiboot2 */
     mov %ebx, %esi                            /* puntero a la info */
@@ -79,6 +80,7 @@ long_mode:
     call kmain
 hang:
     cli
+    cld
     hlt
     jmp hang
 
